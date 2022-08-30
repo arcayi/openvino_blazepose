@@ -6,7 +6,9 @@ from pathlib import Path
 from FPS import FPS, now
 import argparse
 import os
-from openvino.inference_engine import IENetwork, IECore
+# from openvino.inference_engine import IENetwork, IECore
+import onnxruntime
+
 from math import atan2
 
 import open3d as o3d
@@ -14,8 +16,8 @@ from o3d_utils import create_segment, create_grid
 import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-POSE_DETECTION_MODEL = SCRIPT_DIR / "models/pose_detection_FP32.xml"
-LANDMARK_MODEL_FULL = SCRIPT_DIR / "models/pose_landmark_full_FP32.xml"
+POSE_DETECTION_MODEL = SCRIPT_DIR / "models/pose_detection/model_float32.onnx"
+LANDMARK_MODEL_FULL = SCRIPT_DIR / "models/pose_landmark_full/modified_model_float32.onnx"
 LANDMARK_MODEL_LITE = SCRIPT_DIR / "models/pose_landmark_lite_FP32.xml"
 LANDMARK_MODEL_HEAVY = SCRIPT_DIR / "models/pose_landmark_heavy_FP32.xml"
 
@@ -85,6 +87,8 @@ class BlazeposeOpenvino:
                 multi_detection=False,
                 force_detection=False,
                 output=None):
+        self.STAGE = ["pd", "lm"]
+        self.ort_session = {}
         
         self.pd_score_thresh = pd_score_thresh
         self.pd_nms_thresh = pd_nms_thresh
@@ -189,69 +193,65 @@ class BlazeposeOpenvino:
 
     def load_models(self, pd_xml, pd_device, lm_xml, lm_device):
 
-        print("Loading Inference Engine")
-        self.ie = IECore()
-        print("Device info:")
-        versions = self.ie.get_versions(pd_device)
-        print("{}{}".format(" "*8, pd_device))
-        print("{}MKLDNNPlugin version ......... {}.{}".format(" "*8, versions[pd_device].major, versions[pd_device].minor))
-        print("{}Build ........... {}".format(" "*8, versions[pd_device].build_number))
+        # Pose detection, Landmarks
+        #   Pose detection
+        #       Input blob: input - shape: [1, 3, 224, 224]
+        #       Output blob: Identity - shape: [1, 2254, 12]
+        #       Output blob: Identity_1 - shape: [1, 2254, 1]
+        #   Landmarks
+        #       Input blob: input_1 - shape: [1, 3, 256, 256]
+        #       Output blob: ld_3d - shape: [1, 195]
+        #       Output blob: output_heatmap - shape: [1, 39, 64, 64]
+        #       Output blob: output_poseflag - shape: [1, 1]
+        #       Output blob: output_segmentation - shape: [1, 1, 128, 128] (for lite and heavy) or [1, 1, 256, 256] (for full)
+        #       Output blob: world_3d - shape: [1, 117]
+        
+        for st in self.STAGE:
+            print(f"Loading {st} Inference Session")
+            if st =="pd":
+                modelfile = pd_xml
+            elif st =="lm":
+                modelfile = lm_xml
+            print("{}model files ........ {}".format(" "*8, modelfile))
+            self.ort_session[st] = onnxruntime.InferenceSession(modelfile, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            print("{}providers .......... {}".format(" "*8, self.ort_session[st].get_providers()))
+            print("{}provider_options ... {}".format(" "*8, self.ort_session[st].get_provider_options()))
 
-        # Pose detection model
-        pd_name = os.path.splitext(pd_xml)[0]
-        pd_bin = pd_name + '.bin'
-        print("Pose Detection model - Reading network files:\n\t{}\n\t{}".format(pd_xml, pd_bin))
-        self.pd_net = self.ie.read_network(model=pd_xml, weights=pd_bin)
-        # Input blob: input - shape: [1, 3, 224, 224]
-        # Output blob: Identity - shape: [1, 2254, 12]
-        # Output blob: Identity_1 - shape: [1, 2254, 1]
+            dict_IO = {"Input":self.ort_session[st].get_inputs(), "Output":self.ort_session[st].get_outputs()}
+            for str_IOs, IOs in dict_IO.items():
+                for io in IOs:
+                    print("{}{} blob:\t... {}".format(" "*8, str_IOs, io))
+            
+        self.pd_input_blob = self.ort_session["pd"].get_inputs()[0].name
+        _,_,self.pd_h,self.pd_w = self.ort_session["pd"].get_inputs()[0].shape
+            
+        self.pd_scores = self.indexFromNodeArgs("Identity_1", "pd", 1)
+        self.pd_bboxes = self.indexFromNodeArgs("Identity", "pd", 1)
 
-        self.pd_input_blob = next(iter(self.pd_net.input_info))
-        print(f"Input blob: {self.pd_input_blob} - shape: {self.pd_net.input_info[self.pd_input_blob].input_data.shape}")
-        _,_,self.pd_h,self.pd_w = self.pd_net.input_info[self.pd_input_blob].input_data.shape
-        for o in self.pd_net.outputs.keys():
-            print(f"Output blob: {o} - shape: {self.pd_net.outputs[o].shape}")
-        self.pd_scores = "Identity_1"
-        self.pd_bboxes = "Identity"
-        print("Loading pose detection model into the plugin")
-        self.pd_exec_net = self.ie.load_network(network=self.pd_net, num_requests=1, device_name=pd_device)
-        self.pd_infer_time_cumul = 0
-        self.pd_infer_nb = 0
-
-        self.infer_nb = 0
-        self.infer_time_cumul = 0
-
-        # Landmarks model
-        if lm_device != pd_device:
-            print("Device info:")
-            versions = self.ie.get_versions(lm_device)
-            print("{}{}".format(" "*8, lm_device))
-            print("{}MKLDNNPlugin version ......... {}.{}".format(" "*8, versions[lm_device].major, versions[lm_device].minor))
-            print("{}Build ........... {}".format(" "*8, versions[lm_device].build_number))
-
-        lm_name = os.path.splitext(lm_xml)[0]
-        lm_bin = lm_name + '.bin'
-        print("Landmark model - Reading network files:\n\t{}\n\t{}".format(lm_xml, lm_bin))
-        self.lm_net = self.ie.read_network(model=lm_xml, weights=lm_bin)
+        # # Landmarks model
         # Input blob: input_1 - shape: [1, 3, 256, 256]
         # Output blob: ld_3d - shape: [1, 195]
-        # Output blob: output_heatmap - shape: [1, 39, 64, 64]
         # Output blob: output_poseflag - shape: [1, 1]
         # Output blob: output_segmentation - shape: [1, 1, 128, 128] (for lite and heavy) or [1, 1, 256, 256] (for full)
+        # Output blob: output_heatmap - shape: [1, 39, 64, 64]
         # Output blob: world_3d - shape: [1, 117]
-        self.lm_input_blob = next(iter(self.lm_net.input_info))
-        print(f"Input blob: {self.lm_input_blob} - shape: {self.lm_net.input_info[self.lm_input_blob].input_data.shape}")
-        _,_,self.lm_h,self.lm_w = self.lm_net.input_info[self.lm_input_blob].input_data.shape
-        for o in self.lm_net.outputs.keys():
-            print(f"Output blob: {o} - shape: {self.lm_net.outputs[o].shape}")
-        self.lm_score = "output_poseflag"
-        self.lm_segmentation = "output_segmentation"
-        self.lm_landmarks = "ld_3d"
-        self.segmentation_size = self.lm_net.outputs[self.lm_segmentation].shape[-1]
-        print("Loading landmark model to the plugin")
-        self.lm_exec_net = self.ie.load_network(network=self.lm_net, num_requests=1, device_name=lm_device)
-        self.lm_infer_time_cumul = 0
-        self.lm_infer_nb = 0
+
+        # self.lm_input_blob = next(iter(self.lm_net.input_info))
+        # print(f"Input blob: {self.lm_input_blob} - shape: {self.lm_net.input_info[self.lm_input_blob].input_data.shape}")
+        # for o in self.lm_net.outputs.keys():
+        #     print(f"Output blob: {o} - shape: {self.lm_net.outputs[o].shape}")
+
+        self.lm_input_blob = self.ort_session["lm"].get_inputs()[0].name
+        _,_,self.lm_h,self.lm_w = self.ort_session["lm"].get_inputs()[0].shape
+
+        self.lm_score = self.indexFromNodeArgs("output_poseflag", "lm", 1) 
+        self.lm_segmentation = self.indexFromNodeArgs("output_segmentation", "lm", 1) 
+        self.lm_landmarks = self.indexFromNodeArgs("ld_3d", "lm", 1) 
+        # self.segmentation_size = self.lm_net.outputs[self.lm_segmentation].shape[-1]
+        # self.segmentation_size = self.ort_session["lm"].get_outputs()[self.lm_segmentation][-1]
+        # self.segmentation_size = self.ort_session["lm"].get_outputs()[2].shape[-1]
+        
+        self.segmentation_size = self.ort_session["lm"].get_outputs()[self.lm_segmentation].shape[-1]
 
     
     def pd_postprocess(self, inference):
@@ -295,6 +295,9 @@ class BlazeposeOpenvino:
    
     def lm_postprocess(self, region, inference):
         region.lm_score = np.squeeze(inference[self.lm_score])
+        print(f"{self.lm_score=}")
+        print(f"{inference[self.lm_score].shape=}")
+        print(f"{region.lm_score.shape=}")
         if region.lm_score > self.lm_score_threshold:  
             self.nb_active_regions += 1
 
@@ -343,10 +346,11 @@ class BlazeposeOpenvino:
             # If we added padding to make the image square, we need to remove this padding from landmark coordinates
             # region.landmarks_abs contains absolute landmark coordinates in the original image (padding removed))
             region.landmarks_abs = region.landmarks_padded.copy()
-            if self.pad_h > 0:
-                region.landmarks_abs[:,1] -= self.pad_h
-            if self.pad_w > 0:
-                region.landmarks_abs[:,0] -= self.pad_w
+            if not self.crop:
+                if self.pad_h > 0:
+                    region.landmarks_abs[:,1] -= self.pad_h
+                if self.pad_w > 0:
+                    region.landmarks_abs[:,0] -= self.pad_w
 
             if self.use_gesture: self.recognize_gesture(region)
 
@@ -431,6 +435,50 @@ class BlazeposeOpenvino:
         right_pose = int((right_arm_angle +202.5) / 45) % 8
         left_pose = int((left_arm_angle +202.5) / 45) % 8
         r.gesture = semaphore_flag.get((right_pose, left_pose), None)
+
+    def preprocess_images2(self, image, model="pd", region = None):
+        """Process image to the input data of models
+
+        Args:
+            image (_type_): input image
+            model (str, optional): model name. Defaults to "pd".
+            region (_type_, optional): region for model="lm". Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """        
+        # Resize image to NN square input shape
+        if model=="pd":
+            frame_nn = cv2.resize(image, (self.pd_w, self.pd_h), interpolation=cv2.INTER_AREA)
+        elif model=="lm":
+            frame_nn = mpu.warp_rect_img(region.rect_points, image, self.lm_w, self.lm_h)
+
+        frame_nn = np.array(frame_nn, dtype=np.float32)
+        mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        if model=="pd":
+            frame_nn -= mean
+        # Transpose hxwx3 -> 1x3xhxw
+        frame_nn = np.transpose(frame_nn, (2,0,1))[None,] / 255.0
+
+        return frame_nn
+
+    def indexFromNodeArgs(self, name:str, model="pd", direction=1):
+        
+        """Get the indice from input or output NodeAgs list
+
+        Args:
+            name (str): NodeAgs name
+            model (str, optional): "pd" for Pose Detection or "lm" for LandMarks. Defaults to "pd".
+            direction (int, optional): 0 - input; 1-output. Defaults to 0.
+        """
+        if direction == 0:
+            nodeargs = self.ort_session[model].get_inputs()
+        elif direction == 1:
+            nodeargs = self.ort_session[model].get_outputs()
+        for i, val in enumerate(nodeargs):
+            if val.name == name:
+                return i
+        return -1
                 
     def run(self):
 
@@ -477,16 +525,21 @@ class BlazeposeOpenvino:
                 mpu.rect_transformation(self.regions, self.frame_size, self.frame_size)
             else:
                 # Infer pose detection
-                # Resize image to NN square input shape
-                frame_nn = cv2.resize(video_frame, (self.pd_w, self.pd_h), interpolation=cv2.INTER_AREA)
-                # Transpose hxwx3 -> 1x3xhxw
-                frame_nn = np.transpose(frame_nn, (2,0,1))[None,]
+                # # Resize image to NN square input shape
+                # frame_nn = cv2.resize(video_frame, (self.pd_w, self.pd_h), interpolation=cv2.INTER_AREA)
+                # # Transpose hxwx3 -> 1x3xhxw
+                # frame_nn = np.transpose(frame_nn, (2,0,1))[None,]
+                frame_nn = self.preprocess_images2(video_frame, model="pd")
     
                 pd_rtrip_time = now()
-                inference = self.pd_exec_net.infer(inputs={self.pd_input_blob: frame_nn})
+                # inference = self.pd_exec_net.infer(inputs={self.pd_input_blob: frame_nn})
+                ort_inputs = {self.pd_input_blob: frame_nn}
+                inference = self.ort_session["pd"].run(None, ort_inputs)
+                
                 glob_pd_rtrip_time += now() - pd_rtrip_time
                 self.pd_postprocess(inference)
-                self.pd_render(annotated_frame)
+                if args.display>0:
+                    self.pd_render(annotated_frame)
                 nb_pd_inferences += 1
                 if get_new_frame: nb_pd_inferences_direct += 1
 
@@ -499,24 +552,33 @@ class BlazeposeOpenvino:
                 self.vis3d.add_geometry(self.grid_wall, reset_bounding_box=False)
             if self.force_detection:
                 for r in self.regions:
-                    frame_nn = mpu.warp_rect_img(r.rect_points, video_frame, self.lm_w, self.lm_h)
-                    # Transpose hxwx3 -> 1x3xhxw
-                    frame_nn = np.transpose(frame_nn, (2,0,1))[None,] / 255.0
+                    # frame_nn = mpu.warp_rect_img(r.rect_points, video_frame, self.lm_w, self.lm_h)
+                    # # Transpose hxwx3 -> 1x3xhxw
+                    # frame_nn = np.transpose(frame_nn, (2,0,1))[None,] / 255.0
+                    frame_nn = self.preprocess_images2(video_frame, model="lm", region=r)
                     # Get landmarks
                     lm_rtrip_time = now()
-                    inference = self.lm_exec_net.infer(inputs={self.lm_input_blob: frame_nn})
+                    # inference = self.lm_exec_net.infer(inputs={self.lm_input_blob: frame_nn})
+                    ort_inputs = {self.lm_input_blob: frame_nn}
+                    inference = self.ort_session["lm"].run(None, ort_inputs)
+                    
                     glob_lm_rtrip_time += now() - lm_rtrip_time
                     nb_lm_inferences += 1
                     self.lm_postprocess(r, inference)
-                    self.lm_render(annotated_frame, r)
+                    if args.display>0:
+                        self.lm_render(annotated_frame, r)
             elif len(self.regions) == 1:
                 r = self.regions[0]
-                frame_nn = mpu.warp_rect_img(r.rect_points, video_frame, self.lm_w, self.lm_h)
-                # Transpose hxwx3 -> 1x3xhxw
-                frame_nn = np.transpose(frame_nn, (2,0,1))[None,] / 255.0
+                # frame_nn = mpu.warp_rect_img(r.rect_points, video_frame, self.lm_w, self.lm_h)
+                # # Transpose hxwx3 -> 1x3xhxw
+                # frame_nn = np.transpose(frame_nn, (2,0,1))[None,] / 255.0
+                frame_nn = self.preprocess_images2(video_frame, model="lm", region=r)
                 # Get landmarks
                 lm_rtrip_time = now()
-                inference = self.lm_exec_net.infer(inputs={self.lm_input_blob: frame_nn})
+                # inference = self.lm_exec_net.infer(inputs={self.lm_input_blob: frame_nn})
+                ort_inputs = {self.lm_input_blob: frame_nn}
+                inference = self.ort_session["lm"].run(None, ort_inputs)
+
                 glob_lm_rtrip_time += now() - lm_rtrip_time
                 nb_lm_inferences += 1
                 if use_previous_landmarks:
@@ -560,14 +622,20 @@ class BlazeposeOpenvino:
                             # We are sure there is no body in that frame
                         
                         get_new_frame = True
-                self.lm_render(annotated_frame, r) 
+                if args.display>0:
+                    self.lm_render(annotated_frame, r) 
             else:
                 # Detection NN hasn't found any body
                 get_new_frame = True
 
                     
 
-            self.fps.update()  
+            self.fps.update()
+            if len(self.fps.timestamps)>=2:
+                print(f"timestamps : {self.fps.timestamps[0]} s (# interval = {self.fps.timestamps[-1]-self.fps.timestamps[-2]} s)")
+            else:
+                print(f"timestamps : {self.fps.timestamps[0]} s")
+            print(f"FPS : {self.fps.fps:.1f} f/s (# frames = {self.fps.nbf})")
                          
                             
             if self.show_3d:
@@ -581,7 +649,9 @@ class BlazeposeOpenvino:
 
             if self.show_fps:
                 self.fps.draw(annotated_frame, orig=(50,50), size=1, color=(240,180,100))
-            cv2.imshow("Blazepose", annotated_frame)
+            if args.display>0:
+                cv2.namedWindow("Blazepose", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                cv2.imshow("Blazepose", annotated_frame)
 
             if self.output:
                 if self.input_type == "image":
@@ -662,6 +732,8 @@ if __name__ == "__main__":
                         help="Force multiple person detection (at your own risk, the original Mediapipe implementation is designed for one person tracking)")
     parser.add_argument('--force_detection', action="store_true", 
                         help="Force person detection on every frame (never use landmarks from previous frame to determine ROI)")
+    parser.add_argument("-d","--display", type=int, default=0, 
+                        help="Output level to display")
 
     args = parser.parse_args()
 

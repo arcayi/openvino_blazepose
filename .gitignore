@@ -161,3 +161,8 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+.output/
+models.ignored/
+models/mediapipe 0.8.10/
+models/pose_landmark_heavy/modified_model_float32.onnx
