@@ -1,0 +1,4 @@
+onnxruntime
+onnxruntime_gpu 
+open3d
+opencv-python

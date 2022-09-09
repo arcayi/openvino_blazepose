@@ -70,6 +70,18 @@ semaphore_flag = {
         (1,6):'Y', (5,6):'Z'
 }
 
+def cv_show_images(KVS, shape=None):
+    i = 0
+    width, height = shape
+    for k, v in KVS.items():
+        cv2.namedWindow(k, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        if shape is not None:
+            cv2.resizeWindow(k, width, height)
+            # cv2.moveWindow(k, i * width, 10)
+        i += 1
+        if v is not None:
+            cv2.imshow(k, v)
+
 class BlazeposeOpenvino:
     def __init__(self, input_src=None,
                 pd_xml=POSE_DETECTION_MODEL, 
@@ -251,7 +263,7 @@ class BlazeposeOpenvino:
         # self.segmentation_size = self.ort_session["lm"].get_outputs()[self.lm_segmentation][-1]
         # self.segmentation_size = self.ort_session["lm"].get_outputs()[2].shape[-1]
         
-        self.segmentation_size = self.ort_session["lm"].get_outputs()[self.lm_segmentation].shape[-1]
+        self.segmentation_size = self.ort_session["lm"].get_outputs()[self.lm_segmentation].shape[-2]
 
     
     def pd_postprocess(self, inference):
@@ -295,9 +307,9 @@ class BlazeposeOpenvino:
    
     def lm_postprocess(self, region, inference):
         region.lm_score = np.squeeze(inference[self.lm_score])
-        print(f"{self.lm_score=}")
-        print(f"{inference[self.lm_score].shape=}")
-        print(f"{region.lm_score.shape=}")
+        # print(f"{self.lm_score=}")
+        # print(f"{inference[self.lm_score].shape=}")
+        # print(f"{region.lm_score.shape=}")
         if region.lm_score > self.lm_score_threshold:  
             self.nb_active_regions += 1
 
@@ -364,19 +376,24 @@ class BlazeposeOpenvino:
             if self.show_segmentation:
                 ret, mask = cv2.threshold(self.seg, 0.5, 1, cv2.THRESH_BINARY)
                 mask = (mask * 255).astype(np.uint8)
-                cv2.imshow("seg", self.seg)
+                # cv2.imshow("seg", self.seg)
+                # cv_show_images({"seg":self.seg}, (600,400))
                 # cv2.imshow("mask", mask)
+                # cv_show_images({"mask":mask}, (600,400))
                 src = np.array([[0,0],[self.segmentation_size,0],[self.segmentation_size,self.segmentation_size]], dtype=np.float32) # rect_points[0] is left bottom point !
                 dst = np.array(region.rect_points[1:], dtype=np.float32)
+                # print(f"{src=}\n{dst=}")
                 mat = cv2.getAffineTransform(src, dst)
                 mask = cv2.warpAffine(mask, mat, (self.frame_size, self.frame_size))
                 # cv2.imshow("mask2", mask)
+                # cv_show_images({"mask2":mask}, (600,400))
                 # mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
                 l = frame.shape[0]
                 frame2 = cv2.bitwise_and(frame, frame, mask=mask)
                 if not self.crop:
                     frame2 = frame2[self.pad_h:l-self.pad_h, self.pad_w:l-self.pad_w]
-                cv2.imshow("Segmentation", frame2)
+                # cv2.imshow("Segmentation", frame2)
+                cv_show_images({"seg":self.seg, "Segmentation":frame2}, (600,400))
             if self.show_rot_rect:
                 cv2.polylines(frame, [np.array(region.rect_points)], True, (0,255,255), 2, cv2.LINE_AA)
             if self.show_landmarks:
@@ -650,8 +667,9 @@ class BlazeposeOpenvino:
             if self.show_fps:
                 self.fps.draw(annotated_frame, orig=(50,50), size=1, color=(240,180,100))
             if args.display>0:
-                cv2.namedWindow("Blazepose", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-                cv2.imshow("Blazepose", annotated_frame)
+                # cv2.namedWindow("Blazepose", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                # cv2.imshow("Blazepose", annotated_frame)
+                cv_show_images({"Blazepose":annotated_frame}, (600,400))
 
             if self.output:
                 if self.input_type == "image":
@@ -660,7 +678,8 @@ class BlazeposeOpenvino:
                 else:
                     self.output.write(annotated_frame)
 
-            key = cv2.waitKey(1) 
+            # key = cv2.waitKey(1) 
+            key = cv2.pollKey()
             if key == ord('q') or key == 27:
                 break
             elif key == 32:
