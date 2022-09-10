@@ -14,6 +14,7 @@ from math import atan2
 import open3d as o3d
 from o3d_utils import create_segment, create_grid
 import time
+import logging
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 POSE_DETECTION_MODEL = SCRIPT_DIR / "models/pose_detection/model_float32.onnx"
@@ -271,6 +272,8 @@ class BlazeposeOpenvino:
         bboxes = inference[self.pd_bboxes][0] # 2254x12
         # Decode bboxes
         self.regions = mpu.decode_bboxes(self.pd_score_thresh, scores, bboxes, self.anchors, best_only=not self.multi_detection)
+        # for r in self.regions:
+        #     print(f"mpu: region = {','.join('%s: %s' % item for item in vars(r).items())}")
         # Non maximum suppression (not needed if best_only is True)
         if self.multi_detection: 
             self.regions = mpu.non_max_suppression(self.regions, self.pd_nms_thresh)
@@ -281,6 +284,7 @@ class BlazeposeOpenvino:
     def pd_render(self, frame):
         for r in self.regions:
             if self.show_pd_box:
+                # TODO
                 box = (np.array(r.pd_box) * self.frame_size).astype(int)
                 cv2.rectangle(frame, (box[0], box[1]), (box[0]+box[2], box[1]+box[3]), (0,255,0), 2)
             if self.show_pd_kps:
@@ -354,7 +358,7 @@ class BlazeposeOpenvino:
             lm_xyz = np.hstack((lm_xy, lm_z))
             if self.smoothing:
                 lm_xyz = self.filter.apply(lm_xyz)
-            region.landmarks_padded = lm_xyz.astype(np.int)
+            region.landmarks_padded = lm_xyz.astype(np.int32)
             # If we added padding to make the image square, we need to remove this padding from landmark coordinates
             # region.landmarks_abs contains absolute landmark coordinates in the original image (padding removed))
             region.landmarks_abs = region.landmarks_padded.copy()
@@ -500,7 +504,6 @@ class BlazeposeOpenvino:
     def run(self):
 
         self.fps = FPS()
-
         nb_pd_inferences = 0
         nb_pd_inferences_direct = 0 
         nb_lm_inferences = 0
@@ -538,6 +541,8 @@ class BlazeposeOpenvino:
 
             if not self.force_detection and use_previous_landmarks:
                 self.regions = regions_from_landmarks
+                # for r in self.regions:
+                #     print(f"region = {','.join('%s: %s' % item for item in vars(r).items())}")
                 mpu.detections_to_rect(self.regions, kp_pair=[0,1]) # self.regions.pd_kps are initialized from landmarks on previous frame
                 mpu.rect_transformation(self.regions, self.frame_size, self.frame_size)
             else:
@@ -648,11 +653,11 @@ class BlazeposeOpenvino:
                     
 
             self.fps.update()
-            if len(self.fps.timestamps)>=2:
-                print(f"timestamps : {self.fps.timestamps[0]} s (# interval = {self.fps.timestamps[-1]-self.fps.timestamps[-2]} s)")
-            else:
-                print(f"timestamps : {self.fps.timestamps[0]} s")
-            print(f"FPS : {self.fps.fps:.1f} f/s (# frames = {self.fps.nbf})")
+            # if len(self.fps.timestamps)>=2:
+            #     print(f"timestamps : {self.fps.timestamps[0]} s (# interval = {self.fps.timestamps[-1]-self.fps.timestamps[-2]} s)")
+            # else:
+            #     print(f"timestamps : {self.fps.timestamps[0]} s")
+            # print(f"FPS : {self.fps.fps:.1f} f/s (# frames = {self.fps.nbf})")
                          
                             
             if self.show_3d:
@@ -717,6 +722,10 @@ class BlazeposeOpenvino:
            
 
 if __name__ == "__main__":
+    # ODD !!!! logging not working during and after ht = BlazeposeOpenvino(...)
+    # # initialize Log
+    # logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.DEBUG)
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--input', type=str, default='0', 
                         help="Path to video or image file to use as input (default=%(default)s)")
